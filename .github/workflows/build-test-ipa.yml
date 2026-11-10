@@ -1,0 +1,125 @@
+name: Build GestaltX test IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gestaltx-test-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 438f057aee67f38646f1658697acccbd17ae0fe5
+    steps:
+      - name: Check out the fixed official source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: huamidev/GestaltX
+          ref: 438f057aee67f38646f1658697acccbd17ae0fe5
+          persist-credentials: false
+
+      - name: Verify source and installed toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          xcodebuild -version
+          sdk="$(xcrun --sdk iphoneos --show-sdk-version)"
+          test "${sdk%%.*}" -ge 27
+
+      - name: Build with the official entitlement-preserving script
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/build-ipa.sh "$RUNNER_TEMP/gestaltx-output"
+
+      - name: Verify the packaged app and share extension
+        shell: bash
+        env:
+          IPA_PATH: ${{ steps.build.outputs.ipa }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, plistlib, subprocess, tempfile, zipfile
+
+          ipa = pathlib.Path(os.environ["IPA_PATH"])
+          output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "gestaltx-output"
+          assert ipa.is_file() and ipa.parent.resolve() == output.resolve(), "Unexpected IPA output"
+          with zipfile.ZipFile(ipa) as archive:
+              assert archive.testzip() is None, "Corrupt IPA archive"
+              for name in archive.namelist():
+                  parts = pathlib.PurePosixPath(name)
+                  assert not parts.is_absolute() and ".." not in parts.parts, "Unsafe archive path"
+                  assert parts.parts and parts.parts[0] == "Payload", "Unexpected IPA contents"
+
+          reports = []
+          all_groups = []
+          with tempfile.TemporaryDirectory(prefix="gestaltx-verify-") as directory:
+              subprocess.run(["ditto", "-x", "-k", str(ipa), directory], check=True)
+              app = pathlib.Path(directory) / "Payload/GestaltX.app"
+              extension = app / "PlugIns/GestaltXShare.appex"
+              for label, bundle in [("app", app), ("share_extension", extension)]:
+                  assert bundle.is_dir(), f"Missing {label}"
+                  subprocess.run(["codesign", "--verify", "--deep", "--strict", str(bundle)], check=True)
+                  result = subprocess.run(
+                      ["codesign", "-d", "--entitlements", "-", "--xml", str(bundle)],
+                      check=True, capture_output=True,
+                  )
+                  entitlements = plistlib.loads(result.stdout)
+                  groups = entitlements.get("com.apple.security.application-groups")
+                  assert isinstance(groups, list) and groups, f"Missing App Group in {label}"
+                  assert all(isinstance(g, str) and g.startswith("group.") and "$(" not in g for g in groups), "Invalid App Group"
+                  all_groups.append(set(groups))
+                  with (bundle / "Info.plist").open("rb") as handle:
+                      info = plistlib.load(handle)
+                  executable_name = info["CFBundleExecutable"]
+                  assert pathlib.PurePosixPath(executable_name).name == executable_name
+                  executable = bundle / executable_name
+                  subprocess.run(["lipo", "-verify_arch", "arm64", str(executable)], check=True)
+                  (output / f"{label}-entitlements.plist").write_bytes(result.stdout)
+                  reports.append({
+                      "bundle": label,
+                      "bundle_id": info["CFBundleIdentifier"],
+                      "version": info["CFBundleShortVersionString"],
+                      "minimum_os": info.get("MinimumOSVersion"),
+                      "app_groups": sorted(groups),
+                      "arm64": True,
+                      "signature_verified": True,
+                  })
+              common = all_groups[0] & all_groups[1]
+              assert common, "App and extension have no shared App Group"
+              assert reports[0]["version"] == reports[1]["version"], "Mismatched bundle versions"
+
+          digest = hashlib.sha256(ipa.read_bytes()).hexdigest()
+          report = {
+              "source": "https://github.com/huamidev/GestaltX",
+              "source_commit": os.environ["SOURCE_SHA"],
+              "ipa": ipa.name,
+              "sha256": digest,
+              "shared_app_groups": sorted(common),
+              "bundles": reports,
+              "signing": "Ad-hoc only; SideStore must re-sign before installation.",
+              "device_test": "Not performed. The app retains its original editing capabilities.",
+          }
+          (output / "verification.json").write_text(json.dumps(report, indent=2) + "\n")
+          (output / "SHA256SUMS.txt").write_text(f"{digest}  {ipa.name}\n")
+          print(json.dumps(report, indent=2))
+          PY
+          git archive --format=tar.gz --output="$RUNNER_TEMP/gestaltx-output/GestaltX-source.tar.gz" "$SOURCE_SHA"
+          cp LICENSE "$RUNNER_TEMP/gestaltx-output/LICENSE"
+
+      - name: Save verified test build only
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: GestaltX-test-438f057
+          path: ${{ runner.temp }}/gestaltx-output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
